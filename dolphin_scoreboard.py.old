@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""
+dolphin_scoreboard.py - live CTS Dolphin scoreboard.
+
+Reads two live sources and serves a self-refreshing web page:
+  1. USB  - the Dolphin base unit's FTDI stream, decoded to precise per-lane
+            times (algorithm verified against Dolphin50.exe).
+  2. TCP  - the Dolphin software's streaming server, for event #, name, heat #.
+
+All settings live in a config file (scoreboard.ini next to this script by
+default, or pass a path as the first argument). On first run a template is
+written for you to edit.
+
+State semantics (DolphinInterface.MessageState, from Dolphin50.exe):
+    Config=0   Stop=1 (manual stop -> real time)   Reset=2   Run=3
+A lane time is recorded ONLY from a Stop message; Reset-state times (e.g. a
+watch the timer never stopped) are never shown.
+"""
+
+from __future__ import annotations
+
+import configparser
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+
+# --- DolphinInterface.MessageState ---
+STATE_CONFIG, STATE_STOP, STATE_RESET, STATE_RUN, STATE_PROGRAM = 0, 1, 2, 3, 4
+WATCH_LETTERS = ("A", "B", "C")
+
+
+# --------------------------------------------------------------------------- #
+# USB timer-message decoding                                                  #
+# --------------------------------------------------------------------------- #
+def decode_time_ms(m: bytes) -> int:
+    return (m[5] << 25) | (m[6] << 18) | (m[7] << 11) | (m[8] << 4) | (m[9] & 0x0F)
+
+
+def consolidate(times_ms):
+    """Dolphin final-time rule: 1 -> itself, 2 -> average, 3 -> median (ms)."""
+    v = sorted(t for t in times_ms if t > 0)
+    if not v:
+        return 0
+    if len(v) == 1:
+        return v[0]
+    if len(v) == 2:
+        return (v[0] + v[1] + 1) // 2
+    return v[1]
+
+
+def ms_to_str(ms: int) -> str:
+    cs = (ms + 5) // 10
+    minutes, cs = divmod(cs, 6000)
+    secs, cs = divmod(cs, 100)
+    if minutes:
+        return f"{minutes}:{secs:02d}.{cs:02d}"
+    return f"{secs:02d}.{cs:02d}"
+
+
+def iter_messages(byte_iter):
+    """Yield complete 0x80-framed messages from a stream of byte chunks."""
+    buf = bytearray()
+    for chunk in byte_iter:
+        buf += chunk
+        marks = [i for i, b in enumerate(buf) if b & 0x80]
+        if len(marks) < 2:
+            continue
+        for a, b in zip(marks, marks[1:]):
+            yield bytes(buf[a:b])
+        del buf[:marks[-1]]
+
+
+def resolve_tshark(explicit=None):
+    if explicit:
+        if os.path.isfile(explicit):
+            return explicit
+        raise SystemExit(f"tshark not found at: {explicit}")
+    found = shutil.which("tshark")
+    if found:
+        return found
+    for p in (r"C:\Program Files\Wireshark\tshark.exe",
+              r"C:\Program Files (x86)\Wireshark\tshark.exe",
+              "/usr/bin/tshark"):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Shared state                                                                #
+# --------------------------------------------------------------------------- #
+class State:
+    def __init__(self, num_lanes, conversion_factor):
+        self.lock = threading.Lock()
+        self.num_lanes = num_lanes
+        self.conversion_factor = round(float(conversion_factor), 3)
+        # per slot: (state, latched_final_ms, battery, signal)
+        self.slots = {}
+        self.event = {"number": None, "name": None, "heat": None,
+                      "race": None, "index": None}
+        self.usb_ok = False
+        self.tcp_ok = False
+        self.race_running = False
+        self.race_t0 = None
+        self.clock_frozen_ms = 0.0
+
+    def update_slot(self, slot, st, time_ms, battery, signal):
+        with self.lock:
+            prev = self.slots.get(slot)
+            prev_latched = prev[1] if prev else 0
+            if st == STATE_STOP and time_ms > 0:
+                latched = time_ms            # manual stop -> real final time
+            elif st in (STATE_RUN, STATE_CONFIG):
+                latched = 0                  # racing / empty -> no final (new race clears)
+            else:                            # STATE_RESET etc -> keep prior latch
+                latched = prev_latched
+            self.slots[slot] = (st, latched, battery, signal)
+            self.usb_ok = True
+
+    def update_event(self, **kw):
+        with self.lock:
+            self.event.update({k: v for k, v in kw.items() if v is not None})
+            self.tcp_ok = True
+
+    def tick_clock(self):
+        """Gun -> start; Dolphin Reset -> stop+freeze; next gun -> from zero."""
+        with self.lock:
+            states = [r[0] for r in self.slots.values()]
+            any_run = STATE_RUN in states
+            any_reset = STATE_RESET in states
+            now = time.monotonic()
+            if any_run and not self.race_running:
+                self.race_running = True      # gun
+                self.race_t0 = now
+            elif self.race_running and any_reset and not any_run:
+                self.race_running = False     # reset -> stop, freeze last value
+                self.clock_frozen_ms = ((now - self.race_t0) * 1000
+                                        if self.race_t0 else 0.0)
+
+    def snapshot(self):
+        with self.lock:
+            factor = self.conversion_factor
+            lanes = []
+            finals = {}
+            for lane in range(1, self.num_lanes + 1):
+                timers = {}
+                recorded = []
+                any_run = any_present = False
+                for w in range(3):
+                    slot = (lane - 1) * 3 + 2 + w
+                    rec = self.slots.get(slot)
+                    if not rec:
+                        continue
+                    st, latched, b, s = rec
+                    if st != STATE_CONFIG:
+                        any_present = True
+                    if st == STATE_RUN:
+                        any_run = True
+                    if latched > 0:
+                        timers[WATCH_LETTERS[w]] = ms_to_str(latched)
+                        recorded.append(latched)
+                final_ms = consolidate(recorded)
+                if final_ms:
+                    finals[lane] = final_ms
+                if any_run:
+                    status = "racing"
+                elif final_ms:
+                    status = "done"
+                elif any_present:
+                    status = "ready"
+                else:
+                    status = "empty"
+                lanes.append({
+                    "lane": lane, "timers": timers,
+                    "result": ms_to_str(final_ms) if final_ms else "",
+                    "converted": ms_to_str(round(final_ms * factor)) if final_ms else "",
+                    "status": status,
+                })
+            order = sorted(finals, key=lambda L: finals[L])
+            place = {L: i + 1 for i, L in enumerate(order)}
+            for row in lanes:
+                row["place"] = place.get(row["lane"], "")
+
+            now = time.monotonic()
+            if self.race_running and self.race_t0 is not None:
+                clock_ms = (now - self.race_t0) * 1000
+            else:
+                clock_ms = self.clock_frozen_ms
+
+            return {"event": dict(self.event), "lanes": lanes,
+                    "factor": factor,
+                    "clock_ms": clock_ms, "clock_running": self.race_running,
+                    "usb_ok": self.usb_ok, "tcp_ok": self.tcp_ok,
+                    "ts": time.time()}
+
+
+# --------------------------------------------------------------------------- #
+# USB worker                                                                  #
+# --------------------------------------------------------------------------- #
+def usb_byte_chunks(cfg):
+    if cfg.usb_pcapng:
+        cmd = [cfg.tshark, "-r", cfg.usb_pcapng]
+    else:
+        cmd = [cfg.tshark, "-i", cfg.usb_iface, "-l"]
+    cmd += ["-Y", "ftdi-ft.if_a_rx_payload",
+            "-T", "fields", "-e", "ftdi-ft.if_a_rx_payload"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    for line in proc.stdout:
+        line = line.strip()
+        if line:
+            try:
+                yield bytes.fromhex(line)
+            except ValueError:
+                continue
+
+
+def usb_worker(state, cfg):
+    while True:
+        try:
+            for msg in iter_messages(usb_byte_chunks(cfg)):
+                if len(msg) < 11:
+                    continue
+                st = msg[0] & 0x7F
+                slot = msg[1]
+                if slot < 2:
+                    continue
+                lane = (slot - 2) // 3 + 1
+                if not (1 <= lane <= state.num_lanes):
+                    continue
+                state.update_slot(slot, st, decode_time_ms(msg), msg[3], msg[4])
+        except Exception as e:
+            print("USB worker error:", e)
+        if cfg.usb_pcapng:
+            break
+        time.sleep(2)
+
+
+# --------------------------------------------------------------------------- #
+# TCP worker (event / heat / event name)                                      #
+# --------------------------------------------------------------------------- #
+_NUM = re.compile(r"-?\d+")
+
+
+def tcp_worker(state, cfg):
+    term = b"\r\n"
+    names = {}
+    while True:
+        try:
+            with socket.create_connection((cfg.dolphin_host, cfg.dolphin_port),
+                                          timeout=5) as s:
+                s.sendall(b"includeSplitData,ON" + term)
+                s.sendall(b"autoSendUpdates,ON" + term)
+                s.sendall(b"getEventInfo" + term)
+                s.sendall(b"getCurrentEventAndHeat" + term)
+                buf = ""
+                last_poll = 0.0
+                s.settimeout(1.0)
+                while True:
+                    if time.time() - last_poll > 2.0:
+                        try:
+                            s.sendall(b"getCurrentEventAndHeat" + term)
+                        except OSError:
+                            break
+                        last_poll = time.time()
+                    try:
+                        chunk = s.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    buf += chunk.decode("cp1252", "replace")
+                    buf = buf.replace("\r\n", "\n").replace("\r", "\n")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        _parse_tcp_line(line.strip(), state, names)
+        except OSError as e:
+            print("TCP worker (will retry):", e)
+        time.sleep(3)
+
+
+def _parse_tcp_line(line, state, names):
+    if not line:
+        return
+    low = line.lower()
+    if "currenteventandheat" in low or (line.endswith(";") and line.count(",") >= 4):
+        body = line.split(",", 1)[1] if "," in line else line
+        nums = _NUM.findall(body.rstrip(";"))
+        if len(nums) >= 4:
+            idx, num, heat, race = (int(nums[-4]), int(nums[-3]),
+                                    int(nums[-2]), int(nums[-1]))
+            state.update_event(index=idx, number=num, heat=heat, race=race,
+                               name=names.get(idx))
+        return
+    if low.startswith("eventchanged,") or low.startswith("geteventinfo") \
+            or low.startswith("eventinfo,"):
+        for rec in _split_records(line):
+            f = rec.split(",")
+            if len(f) >= 3 and f[0].lstrip("-").isdigit():
+                nm = f[2].strip()
+                if nm:
+                    names[int(f[0])] = nm
+        with state.lock:
+            ci = state.event.get("index")
+            if ci in names:
+                state.event["name"] = names[ci]
+
+
+def _split_records(line):
+    for sep in (";", "|", "\t"):
+        if sep in line:
+            return [r for r in line.split(sep) if r]
+    return [line]
+
+
+# --------------------------------------------------------------------------- #
+# Web page                                                                    #
+# --------------------------------------------------------------------------- #
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>Dolphin Scoreboard</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;background:#0a0e14;color:#e6edf3;
+       font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{display:flex;align-items:center;gap:32px;padding:16px 28px;
+         background:linear-gradient(180deg,#11202e,#0a0e14);
+         border-bottom:1px solid #1f2d3d}
+  table.eh{border-collapse:collapse;text-align:center}
+  table.eh th{font-size:12px;letter-spacing:.14em;color:#6e8198;font-weight:600;
+              padding:0 18px 4px;border-bottom:1px solid #25364a}
+  table.eh td{font-size:46px;font-weight:800;line-height:1;padding:8px 18px 0;
+              font-variant-numeric:tabular-nums}
+  .center{flex:1;min-width:0}
+  .evname{font-size:28px;font-weight:700;white-space:nowrap;overflow:hidden;
+          text-overflow:ellipsis}
+  .sub{font-size:14px;color:#9fb3c8;margin-top:4px}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-left:6px}
+  .on{background:#2ecc71}.off{background:#e74c3c}
+  .clockbox{text-align:right}
+  .clocklbl{font-size:12px;letter-spacing:.14em;color:#6e8198}
+  .clock{font-size:64px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+  .clock.run{color:#5fb3f0}
+  table.board{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  table.board th,table.board td{padding:10px 16px;text-align:left}
+  table.board th{font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+                 color:#6e8198;border-bottom:1px solid #1f2d3d}
+  tr.lane{border-bottom:1px solid #141c26;transition:background .2s}
+  tr.lane.done{background:#0d1722}
+  tr.lane.first{background:rgba(255,213,74,.12)}
+  .ln{font-size:22px;font-weight:700;color:#9fb3c8;width:64px}
+  .pl{font-size:24px;font-weight:800;width:64px;color:#e6edf3}
+  .converted{font-size:31px;font-weight:800}
+  .result{font-size:23px;font-weight:600;color:#c8d6e5}
+  .timer{font-size:23px;font-weight:600;color:#c8d6e5}
+  .empty{opacity:.32}
+  footer{padding:10px 28px;color:#42566b;font-size:12px}
+</style></head><body>
+<header>
+  <table class="eh">
+    <tr><th>EVENT</th><th>HEAT</th></tr>
+    <tr><td id="evnum">-</td><td id="heat">-</td></tr>
+  </table>
+  <div class="center">
+    <div class="evname" id="evname">Waiting for data...</div>
+    <div class="sub">Race <span id="race">-</span>
+      <span id="usb" class="dot off" title="USB feed"></span>
+      <span id="tcp" class="dot off" title="TCP feed"></span></div>
+  </div>
+  <div class="clockbox">
+    <div class="clocklbl">RACE CLOCK</div>
+    <div class="clock" id="clock">0:00.00</div>
+  </div>
+</header>
+<table class="board"><thead><tr>
+  <th>Lane</th><th>Place</th>
+  <th>Converted Result</th><th>Result Time</th>
+  <th>Timer A</th><th>Timer B</th><th>Timer C</th>
+</tr></thead><tbody id="rows"></tbody></table>
+<footer>Auto-updating &middot; <span id="age">-</span></footer>
+<script>
+let clkBase=0, clkRun=false, clkAnchor=performance.now();
+function fmtClock(ms){
+  if(ms<0)ms=0;
+  let cs=Math.floor(ms/10);
+  let m=Math.floor(cs/6000); cs-=m*6000;
+  let s=Math.floor(cs/100);  cs-=s*100;
+  return m+':'+String(s).padStart(2,'0')+'.'+String(cs).padStart(2,'0');
+}
+function renderClock(){
+  const ms = clkRun ? clkBase+(performance.now()-clkAnchor) : clkBase;
+  const el=document.getElementById('clock');
+  el.textContent=fmtClock(ms);
+  el.className='clock'+(clkRun?' run':'');
+  requestAnimationFrame(renderClock);
+}
+requestAnimationFrame(renderClock);
+
+async function tick(){
+  try{
+    const r=await fetch('/data',{cache:'no-store'});
+    const d=await r.json();
+    clkBase=d.clock_ms; clkRun=d.clock_running; clkAnchor=performance.now();
+    document.getElementById('usb').className='dot '+(d.usb_ok?'on':'off');
+    document.getElementById('tcp').className='dot '+(d.tcp_ok?'on':'off');
+    const e=d.event||{};
+    document.getElementById('evnum').textContent=e.number ?? '-';
+    document.getElementById('heat').textContent=e.heat ?? '-';
+    document.getElementById('race').textContent=e.race ?? '-';
+    document.getElementById('evname').textContent=
+        e.name || (e.number?('Event '+e.number):'Waiting for data...');
+    const tb=document.getElementById('rows'); tb.innerHTML='';
+    for(const L of d.lanes){
+      const empty=!L.result && L.status==='empty';
+      const t=L.timers||{};
+      const tr=document.createElement('tr');
+      tr.className='lane'+(L.result?' done':'')+(L.place===1?' first':'')+(empty?' empty':'');
+      tr.innerHTML=
+        `<td class="ln">${L.lane}</td>`+
+        `<td class="pl">${L.place||''}</td>`+
+        `<td class="converted">${L.converted||''}</td>`+
+        `<td class="result">${L.result||''}</td>`+
+        `<td class="timer">${t.A||''}</td>`+
+        `<td class="timer">${t.B||''}</td>`+
+        `<td class="timer">${t.C||''}</td>`;
+      tb.appendChild(tr);
+    }
+    document.getElementById('age').textContent=
+        ((Date.now()/1000)-d.ts).toFixed(1)+'s since last server update';
+  }catch(err){ document.getElementById('age').textContent='disconnected'; }
+}
+setInterval(tick,350); tick();
+</script></body></html>"""
+
+
+def make_handler(state):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/data"):
+                body = json.dumps(state.snapshot()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(PAGE.encode())
+    return H
+
+
+# --------------------------------------------------------------------------- #
+# Config                                                                       #
+# --------------------------------------------------------------------------- #
+DEFAULT_CONFIG = r"""[scoreboard]
+# USBPcap interface the Dolphin base unit is on.
+# List interfaces with:  "C:\Program Files\Wireshark\tshark.exe" -D
+usb_iface = USBPcap1
+
+# Dolphin software TCP/IP streaming server (Settings > Streaming)
+dolphin_host = 127.0.0.1
+dolphin_port = 5000
+
+# Number of pool lanes
+lanes = 6
+
+# Pool conversion factor, 3 decimals.  converted = result_time x factor
+conversion_factor = 1.000
+
+# Web page port
+http_port = 8532
+
+# --- optional ---
+# tshark_path = C:\Program Files\Wireshark\tshark.exe
+# no_tcp = false
+# usb_pcapng =            ; set to a capture file for offline testing
+"""
+
+
+def load_config(path):
+    if not os.path.isfile(path):
+        with open(path, "w") as f:
+            f.write(DEFAULT_CONFIG)
+        raise SystemExit(
+            f"No config found. A template was created at:\n  {path}\n"
+            "Edit it (set usb_iface and dolphin_port), then run again.")
+    cp = configparser.ConfigParser()
+    cp.read(path)
+    if not cp.has_section("scoreboard"):
+        raise SystemExit(f"{path} is missing a [scoreboard] section.")
+    s = cp["scoreboard"]
+    return SimpleNamespace(
+        usb_iface=s.get("usb_iface", "").strip(),
+        usb_pcapng=s.get("usb_pcapng", "").strip(),
+        dolphin_host=s.get("dolphin_host", "127.0.0.1").strip(),
+        dolphin_port=s.getint("dolphin_port", 0),
+        lanes=s.getint("lanes", 10),
+        conversion_factor=s.getfloat("conversion_factor", 1.0),
+        http_port=s.getint("http_port", 8532),
+        tshark=(s.get("tshark_path", "").strip() or None),
+        no_tcp=s.getboolean("no_tcp", False),
+    )
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "scoreboard.ini")
+    cfg = load_config(cfg_path)
+
+    cfg.tshark = resolve_tshark(cfg.tshark)
+    if not cfg.tshark:
+        raise SystemExit(
+            "Could not find tshark. Install Wireshark (with the USBPcap "
+            "component), then set tshark_path in the config or add Wireshark "
+            "to PATH.")
+    print("Config:", cfg_path)
+    print("Using tshark:", cfg.tshark)
+
+    state = State(cfg.lanes, cfg.conversion_factor)
+    threading.Thread(target=usb_worker, args=(state, cfg), daemon=True).start()
+
+    def clock_thread():
+        while True:
+            state.tick_clock()
+            time.sleep(0.05)
+    threading.Thread(target=clock_thread, daemon=True).start()
+
+    if not cfg.no_tcp and cfg.dolphin_port:
+        threading.Thread(target=tcp_worker, args=(state, cfg), daemon=True).start()
+    else:
+        print("TCP event feed disabled (no_tcp or no dolphin_port).")
+
+    httpd = ThreadingHTTPServer(("0.0.0.0", cfg.http_port), make_handler(state))
+    print(f"Scoreboard live at http://localhost:{cfg.http_port}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
