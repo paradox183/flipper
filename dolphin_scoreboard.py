@@ -33,6 +33,12 @@ from types import SimpleNamespace
 STATE_CONFIG, STATE_STOP, STATE_RESET, STATE_RUN, STATE_PROGRAM = 0, 1, 2, 3, 4
 WATCH_LETTERS = ("A", "B", "C")
 
+# While a race is running, a changed event/heat from the Dolphin must hold for
+# at least this long before it's shown. This distinguishes a deliberate mid-race
+# correction (which holds) from the heat auto-advance the Dolphin emits as part
+# of a reset (which arrives together with the clock stop and so never holds).
+EVENT_FOLLOW_DELAY = 1.0
+
 
 # --------------------------------------------------------------------------- #
 # USB timer-message decoding                                                  #
@@ -129,6 +135,7 @@ class State:
         self.race_running = False
         self.race_t0 = None
         self.clock_frozen_ms = 0.0
+        self.live_changed_at = 0.0         # when live_event last changed
 
     def set_event_map(self, m):
         with self.lock:
@@ -149,12 +156,17 @@ class State:
 
     def update_event(self, number, heat, race, index):
         with self.lock:
+            prev = self.live_event
+            if number != prev.get("number") or heat != prev.get("heat"):
+                self.live_changed_at = time.monotonic()
             self.live_event = {"number": number, "heat": heat,
                                "race": race, "index": index}
             self.tcp_ok = True
-            # Before the first race, track the Dolphin live value so the board
-            # shows the upcoming heat. After the first gun, 'shown' only changes
-            # at gun edges (see tick_clock), which is robust to reset timing.
+            # Before the first race, mirror the Dolphin value immediately so the
+            # board previews the upcoming heat. Once racing, mid-race changes are
+            # adopted by tick_clock only after they've held (EVENT_FOLLOW_DELAY),
+            # which keeps the reset auto-advance from sticking. While the clock
+            # is stopped between races we hold the heat that was just raced.
             if not self.has_run:
                 self.shown_event = dict(self.live_event)
 
@@ -175,6 +187,17 @@ class State:
                 self.clock_frozen_ms = ((now - self.race_t0) * 1000
                                         if self.race_t0 else 0.0)
                 self.between_races = True
+
+            # While running, adopt a changed live event/heat only once it has
+            # held for EVENT_FOLLOW_DELAY -- a deliberate mid-race correction
+            # holds, the reset auto-advance (it lands as the clock is stopping)
+            # does not, so the board keeps the heat that was just raced.
+            if self.race_running and self.shown_event is not None:
+                live = self.live_event
+                if (live.get("number") != self.shown_event.get("number")
+                        or live.get("heat") != self.shown_event.get("heat")):
+                    if now - self.live_changed_at >= EVENT_FOLLOW_DELAY:
+                        self.shown_event = dict(live)
 
     def _next_heat(self, ev):
         """Compute the next event/heat from the CSV heat counts."""
@@ -375,9 +398,10 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
   table.eh{border-collapse:collapse;text-align:center}
   table.eh th{font-size:12px;letter-spacing:.14em;color:#6e8198;font-weight:600;
               padding:0 18px 4px;border-bottom:1px solid #25364a}
-  table.eh td{font-size:46px;font-weight:800;line-height:1;padding:8px 18px 0;
+  table.eh td{font-size:66px;font-weight:800;line-height:1;padding:8px 18px 0;
               font-variant-numeric:tabular-nums}
   table.eh.next{font-style:italic}
+  table.eh.next td{font-size:46px}
   table.eh.next .nexthdr{font-size:12px;letter-spacing:.16em;color:#c9a227;
               border-bottom:1px solid #3a3320;padding-bottom:5px}
   .evname{font-size:28px;font-weight:700;max-width:46vw;white-space:nowrap;
