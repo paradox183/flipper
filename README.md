@@ -49,6 +49,7 @@ There is one quirk to the event/heat numbers.  As you know, it is possible to ch
 ## Current limitations
 
 * Only knows events and heats as of the start of the race.  Any changes during the race are not reflected.
+* No logic for splits (NWSC does not use splits)
 
 ## Potential improvements / to-dos
 
