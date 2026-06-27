@@ -35,6 +35,8 @@ The race clock keeps running until the Dolphin software is reset.  At that time,
 
 There is one quirk to the event/heat numbers.  As you know, it is possible to change event/heat during a race, and Dolphin automatically advances event/heat as necessary upon reset.  Flipper cannot take the current event/heat at face value; otherwise, once the race is reset it will appear to show results for the upcoming race, not the race that was just run.  To work around this, Flipper waits for one second after the event/heat numbers change before displaying that in the web GUI.  If it detects a reset within that one second window, it will *not* update the current event/heat number on screen.  This seems to adequately accept manual changes while rejecting the automatic advance upon reset.
 
+Since Flipper is mostly only reading live USB traffic, and Dolphin can already save its own results files (.txt, .xml, .do3, .do4, etc.), everything that Flipper does is completely ephemeral.  It does not store any race data on its own.
+
 ## scoreboard.ini Settings
 
 * `usb_iface` - the USB interface to which the Dolphin base unit is connected
