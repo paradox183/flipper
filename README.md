@@ -58,4 +58,4 @@ There is one quirk to the event/heat numbers.  As you know, it is possible to ch
 
 ## Disclaimer
 
-This was done completely with Claude Opus.  I am not a developer.
+This was done completely with Claude Opus.  I am not a developer.  Claude also had to decompile Dolphin50.exe in order to understand the bit shift in watch times.
