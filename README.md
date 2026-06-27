@@ -33,7 +33,7 @@ It then applies the pool conversion specified in scoreboard.ini.
 
 The race clock keeps running until the Dolphin software is reset.  At that time, the race clock stops and the next event/heat is shown on screen.  The race results and event/heat number are held on the screen until the next race starts, at which point the times are cleared and the race clock starts from zero.
 
-There is one quirk to the event/heat numbers.  As you know, it is possible to change event/heat during a race, and Dolphin automatically advances event/heat as necessary upon reset.  Flipper cannot take the current event/heat at face value; otherwise, once the race is reset it will appear to show events for the upcoming race, not the race that was just run.  To work around this, Flipper waits for one second after the event/heat numbers change before displaying that in the web GUI.  This seems to adequately accept manual changes while rejecting the automatic advance upon reset.
+There is one quirk to the event/heat numbers.  As you know, it is possible to change event/heat during a race, and Dolphin automatically advances event/heat as necessary upon reset.  Flipper cannot take the current event/heat at face value; otherwise, once the race is reset it will appear to show results for the upcoming race, not the race that was just run.  To work around this, Flipper waits for one second after the event/heat numbers change before displaying that in the web GUI.  This seems to adequately accept manual changes while rejecting the automatic advance upon reset.
 
 ## scoreboard.ini Settings
 
